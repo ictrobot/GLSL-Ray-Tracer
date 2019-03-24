@@ -1,0 +1,516 @@
+<!--
+The MIT License (MIT)
+
+Copyright (c) 2019 Ethan Jones
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+-->
+
+<html>
+<head>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+    <title>GLSL Ray Tracer</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+        }
+
+        body, html {
+            height: 100%;
+        }
+
+        #canvas {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+        }
+    </style>
+</head>
+<body>
+
+    <canvas id="canvas"></canvas>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.3.1/jquery.min.js"
+            integrity="sha256-FgpCb/KJQlLNfOu91ta32o/NMZxltwRo8QtmkMRdAu8=" crossorigin="anonymous"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/101/three.js"
+            integrity="sha256-RyTgT+AfEJDVIZ8Yj5eMwXqJGdOxhy8/E78RvQBgEoI=" crossorigin="anonymous"></script>
+
+    <!-- Fragment shader -->
+    <script id="fs" type="x-shader/x-fragment">
+        #ifdef GL_ES
+        precision highp float;
+        #endif
+
+        varying vec2 pos;
+
+        uniform vec3 eye;
+        uniform vec3 ray00;
+        uniform vec3 ray01;
+        uniform vec3 ray10;
+        uniform vec3 ray11;
+
+        out vec4 out_FragColor;
+
+        #define EPSILON 0.001
+        #define PI 3.1415926535897932384626433832795
+
+        struct Object {
+          vec3 point;
+          bool type; // false: plane                true: sphere
+          vec3 data; // data = normal for plane     data.x = radius for sphere
+
+          vec3 colour;
+          float phong_kD;
+          float phong_kS;
+          float phong_alpha;
+          float reflectivity;
+        };
+
+        struct Light {
+            vec3 point;
+            vec3 colour;
+            float intensity;
+            float size;
+        };
+
+        struct Ray {
+            vec3 origin;
+            vec3 direction;
+        };
+
+        struct RaycastHit {
+            bool hit;
+            Object obj;
+            float distance;
+            vec3 position;
+            vec3 normal;
+        };
+
+        const float Inf = 1.0 / 0.0;
+        const Object MISS_OBJ = Object(vec3(+Inf), true, vec3(+Inf), vec3(1.0), 1.0, 1.0, 1.0, 1.0);
+        const RaycastHit MISS = RaycastHit(false, MISS_OBJ, +Inf, vec3(+Inf), vec3(0));
+
+        uniform Object OBJECTS[OBJECT_COUNT];
+        uniform Light LIGHTS[LIGHT_COUNT];
+
+        float length2(vec3 v) {
+            return dot(v,v);
+        }
+
+        vec3 evaluateRay(Ray ray, float dist) {
+            return ray.origin + (dist * ray.direction);
+        }
+
+        RaycastHit intersectSphere(Object sphere, Ray ray) {
+            float a = length2(ray.direction);
+            float b = 2.0 * dot(ray.direction, ray.origin - sphere.point);
+            float c = length2(ray.origin - sphere.point) - (sphere.data.x * sphere.data.x);
+
+            float discriminant = b*b - 4.0*a*c;
+            if (discriminant < 0.0) return MISS; // no intersection
+
+            float discriminant_sqrt = sqrt(discriminant);
+            float solution1 = (-b + discriminant_sqrt) / (2.0 * a);
+            float solution2 = (-b - discriminant_sqrt) / (2.0 * a);
+
+            float dist;
+            if (solution1 < 0.0 && solution2 < 0.0) {
+                return MISS; // behind camera
+            } else if (solution1 > 0.0 && solution2 > 0.0) {
+                dist = min(solution1, solution2); // sphere intersects twice, return closest
+            } else if (solution1 > 0.0) {
+                dist = solution1;
+            } else {
+                dist = solution2;
+            }
+
+            vec3 hit_location = evaluateRay(ray, dist);
+            vec3 hit_normal = normalize(hit_location - sphere.point);
+            return RaycastHit(true, sphere, dist, hit_location, hit_normal);
+        }
+
+        RaycastHit intersectPlane(Object plane, Ray ray) {
+            vec3 N = plane.data;
+            float DdotN = dot(ray.direction, N);
+            if (DdotN == 0.0) return MISS;
+            float s = dot(plane.point - ray.origin, N) / DdotN;
+            if (s < 0.0) return MISS;
+            vec3 hit_location = evaluateRay(ray, s);
+            return RaycastHit(true, plane, s, hit_location, N);
+        }
+
+        RaycastHit intersectObject(Object object, Ray ray) {
+            if (object.type) {
+                return intersectSphere(object, ray);
+            } else {
+                return intersectPlane(object, ray);
+            }
+        }
+
+        RaycastHit closestIntersection(Ray ray) {
+            RaycastHit hit = MISS;
+            for(int i=0; i<OBJECT_COUNT; i++) {
+                Object object = OBJECTS[i];
+                RaycastHit test = intersectObject(object, ray);
+                if (test.distance < hit.distance) hit = test;
+            }
+            return hit;
+        }
+
+
+        vec3 reflectIn(vec3 d, vec3 n) {
+            return (n * 2.0 * dot(d, n)) - d;
+        }
+
+        vec3 illuminate(RaycastHit hit, Ray ray) {
+            vec3 C_diff = hit.obj.colour;
+            vec3 result = C_diff * AMBIENT;
+
+            for (int l = 0; l < LIGHT_COUNT; l++) {
+                Light light = LIGHTS[l];
+                float distanceToLight = length(light.point - hit.position);
+                vec3 C_spec = light.colour;
+                vec3 I = light.colour * light.intensity / (PI * 4.0 * distanceToLight * distanceToLight);
+
+                vec3 L = normalize(light.point - hit.position);
+                vec3 V = normalize(ray.origin - hit.position);
+                vec3 R = normalize(reflectIn(L, hit.normal));
+
+                Ray shadowRay = Ray(hit.position + (L * EPSILON), L);
+                RaycastHit shadowHit = closestIntersection(shadowRay);
+                if (shadowHit.distance > distanceToLight) {
+                    result += C_diff * I * hit.obj.phong_kD * max(0.0, dot(hit.normal, L));
+                    result += C_spec * I * hit.obj.phong_kS * pow(max(0.0, dot(R, V)), hit.obj.phong_alpha);
+                }
+            }
+
+            return result;
+        }
+
+        vec3 trace(Ray inRay) {
+            Ray ray = inRay;
+            float remaining = 1.0;
+            vec3 result = vec3(0);
+            vec3 illumination;
+
+            for (int b = 0; b < BOUNCES && remaining > 0.0; b++) {
+                RaycastHit hit = closestIntersection(ray);
+                float reflectivity;
+
+                if (hit.hit) {
+                    illumination = illuminate(hit, ray);
+                    reflectivity = max(0.0, hit.obj.reflectivity);
+                } else {
+                    illumination = BACKGROUND_COLOUR;
+                    reflectivity = 0.0;
+                }
+
+                result += illumination * remaining * (1.0 - reflectivity);
+                remaining *= reflectivity;
+
+                vec3 R = normalize(reflectIn(normalize(ray.direction * -1.0), hit.normal));
+                ray = Ray(hit.position + (R * EPSILON), R);
+            }
+
+            result += illumination * remaining;
+            return result;
+        }
+
+        #ifdef TONEMAP
+        vec3 powVec3(vec3 vec, float e) {
+            return vec3(pow(vec.x, e), pow(vec.y, e), pow(vec.z, e));
+        }
+
+        vec3 tonemap(vec3 linear) {
+            float invGamma = 1.0 / 2.2;
+            float a = 2.0;
+            float b = 1.3;
+            float c = pow(0.5 / a, b);
+
+            vec3 powRGB = powVec3(linear, b);
+            vec3 displayRGB = powRGB * (1.0 / (powRGB + c));
+            return powVec3(displayRGB, invGamma);
+        }
+        #endif
+
+        void main() {
+            vec3 direction = mix(mix(ray00, ray01, pos.y), mix(ray10, ray11, pos.y), pos.x);
+            RaycastHit hit = closestIntersection(Ray(eye, normalize(direction)));
+            vec3 color = trace(Ray(eye, normalize(direction)));
+            #ifdef TONEMAP
+            color = tonemap(color);
+            #endif
+            out_FragColor = vec4(color, 1);
+        }
+    </script>
+
+    <!-- Vertex Shader -->
+    <script id="vs" type="x-shader/x-vertex">
+        #version 300 es
+
+        varying vec2 pos;
+
+        void main() {
+            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+            gl_Position = projectionMatrix * mvPosition;
+            pos = (vec2(position.x, position.y) + 1.0) / 2.0;
+        }
+    </script>
+
+    <!--  Scene definition  -->
+    <script>
+        SCENE = {
+            objects: [
+                {
+                    point: new THREE.Vector3(0.0, -0.10622, 4.68013),
+                    type: false,
+                    data: new THREE.Vector3(0, 4.2239089012146, -2.180126190185547).normalize(),
+                    colour: new THREE.Vector3(0.067, 0.067, 0.067),
+                    phong_kD: 0.6,
+                    phong_kS: 0.0,
+                    phong_alpha: 1.0,
+                    reflectivity: 0.1
+                }, {
+                    point: new THREE.Vector3(-0.95, -0.21884, 3.63261),
+                    type: true,
+                    data: new THREE.Vector3(0.35, 0.35, 0.35),
+                    colour: new THREE.Vector3(1.0, 0.114, 0.145),
+                    phong_kD: 0.8,
+                    phong_kS: 1.2,
+                    phong_alpha: 10.0,
+                    reflectivity: 0.3
+                }, {
+                    point: new THREE.Vector3(-0.4, 0.5, 4.33013),
+                    type: true,
+                    data: new THREE.Vector3(0.7, 0.7, 0.7),
+                    colour: new THREE.Vector3(0, 0.443, 0.737),
+                    phong_kD: 0.8,
+                    phong_kS: 1.2,
+                    phong_alpha: 10.0,
+                    reflectivity: 0.3
+                }, {
+                    point: new THREE.Vector3(0.72734, -0.35322, 3.19986),
+                    type: true,
+                    data: new THREE.Vector3(0.45, 0.45, 0.45),
+                    colour: new THREE.Vector3(0.227, 0.627, 0.063),
+                    phong_kD: 0.8,
+                    phong_kS: 1.2,
+                    phong_alpha: 10.0,
+                    reflectivity: 0.3
+                },
+            ],
+            lights: [
+                {
+                    point: new THREE.Vector3(2, 2, 4.5),
+                    colour: new THREE.Vector3(1, 1, 1),
+                    intensity: 80,
+                    size: 0.4
+                },
+                {
+                    point: new THREE.Vector3(-2, 2.5, 1.0),
+                    colour: new THREE.Vector3(0.667, 0.667, 1.0),
+                    intensity: 50,
+                    size: 0.4
+                }
+            ],
+            properties: {
+                useToneMapping: true,
+                ambientLightColor: new THREE.Vector3(0.004, 0.004, 0.004),
+                backgroundColor: new THREE.Vector3(0.001, 0.001, 0.001),
+                bounces: 2
+            }
+        };
+    </script>
+
+    <script>
+        new function () {
+
+            // Three.js setup
+
+            var canvas = document.getElementById("canvas");
+            var renderer = new THREE.WebGLRenderer({canvas: canvas, context: canvas.getContext('webgl2')});
+
+            var scene = new THREE.Scene();
+            var camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 100.0);
+            camera.position.z = 1.0;
+            scene.add(camera);
+
+            var uniforms = {
+                eye: {value: new THREE.Vector3()},
+                ray00: {value: new THREE.Vector3()},
+                ray01: {value: new THREE.Vector3()},
+                ray10: {value: new THREE.Vector3()},
+                ray11: {value: new THREE.Vector3()},
+                OBJECTS: {
+                    value: SCENE.objects,
+                    properties: {
+                        point: {},
+                        type: {},
+                        data: {},
+                        colour: {},
+                        phong_kD: {},
+                        phong_kS: {},
+                        phong_alpha: {},
+                        reflectivity: {}
+                    }
+                },
+                LIGHTS: {
+                    value: SCENE.lights,
+                    properties: {
+                        point: {},
+                        colour: {},
+                        intensity: {},
+                        size: {}
+                    }
+                }
+            };
+
+            function getFragmentPrefix() {
+                function glslVec3String(threeVec) {
+                    return "vec3(" + threeVec.x + "," + threeVec.y + "," + threeVec.z + ")";
+                }
+
+                var prefix = "#version 300 es\n";
+                prefix += "#define OBJECT_COUNT " + SCENE.objects.length + "\n";
+                prefix += "#define LIGHT_COUNT " + SCENE.lights.length + "\n";
+                if (SCENE.properties.useToneMapping) prefix += "#define TONEMAP\n";
+                prefix += "const vec3 AMBIENT = " + glslVec3String(SCENE.properties.ambientLightColor) + ";\n";
+                prefix += "const vec3 BACKGROUND_COLOUR = " + glslVec3String(SCENE.properties.backgroundColor) + ";\n";
+                prefix += "const int BOUNCES = " + SCENE.properties.bounces + ";\n";
+                return prefix;
+            }
+
+            var material = new THREE.ShaderMaterial({
+                uniforms: uniforms,
+                vertexShader: document.getElementById("vs").textContent.trim(),
+                fragmentShader: getFragmentPrefix() + document.getElementById("fs").textContent.trim()
+            });
+
+            var geometry = new THREE.Geometry();
+            geometry.vertices.push(new THREE.Vector3(-1, -1, 0));
+            geometry.vertices.push(new THREE.Vector3(1, -1, 0));
+            geometry.vertices.push(new THREE.Vector3(1, 1, 0));
+            geometry.vertices.push(new THREE.Vector3(-1, 1, 0));
+            geometry.faces.push(new THREE.Face3(0, 1, 2));
+            geometry.faces.push(new THREE.Face3(0, 2, 3));
+
+            var mesh = new THREE.Mesh(geometry, material);
+            scene.add(mesh);
+
+            // Uniform management
+
+            var cameraAzimuth = Math.PI;
+            var cameraElevation = 0;
+            var cameraDistance = 5;
+            var cameraCenter = new THREE.Vector3(0, 0, 4);
+            var threeCamera = new THREE.PerspectiveCamera(45, canvas.width / canvas.height, 1, 1000);
+
+            function getCameraPosition(outVector) {
+                outVector.set(
+                    cameraDistance * Math.cos(cameraElevation) * Math.sin(cameraAzimuth),
+                    cameraDistance * Math.sin(cameraElevation),
+                    cameraDistance * Math.cos(cameraElevation) * Math.cos(cameraAzimuth));
+                return outVector.add(cameraCenter);
+            }
+
+            function getEyeRay(outVector, x, y) {
+                threeCamera.aspect = canvas.width / canvas.height;
+                getCameraPosition(threeCamera.position);
+                threeCamera.lookAt(cameraCenter);
+                threeCamera.updateMatrixWorld();
+                threeCamera.updateProjectionMatrix();
+                var MVP = new THREE.Matrix4().multiplyMatrices(threeCamera.projectionMatrix, threeCamera.matrixWorldInverse);
+                var MVPInverse = new THREE.Matrix4().getInverse(MVP);
+
+                return outVector.set(-x, y, 0, 1).applyMatrix4(MVPInverse).sub(threeCamera.position).normalize();
+            }
+
+            function updateUniforms() {
+                getCameraPosition(uniforms.eye.value);
+                getEyeRay(uniforms.ray00.value, -1, -1);
+                getEyeRay(uniforms.ray10.value, 1, -1);
+                getEyeRay(uniforms.ray01.value, -1, 1);
+                getEyeRay(uniforms.ray11.value, 1, 1);
+            }
+
+            function redraw() {
+                updateUniforms();
+                renderer.render(scene, camera);
+            }
+
+            function resizeCanvas() {
+                canvas.width = window.innerWidth;
+                canvas.height = window.innerHeight;
+                renderer.setSize(canvas.width, canvas.height);
+                redraw();
+            }
+
+            // Input handling
+
+            function cameraRotate(deltaX, deltaY) {
+                var sensitivity = -0.005;
+                cameraAzimuth += sensitivity * deltaX;
+                cameraAzimuth %= (Math.PI * 2);
+                cameraElevation -= sensitivity * deltaY;
+                cameraElevation = Math.max(0, Math.min(Math.PI / 2 - 0.001, cameraElevation));
+            }
+
+            function cameraZoom(zoomIn) {
+                var sensitivity = 1.05;
+                if (zoomIn) {
+                    cameraDistance /= sensitivity;
+                } else {
+                    cameraDistance *= sensitivity;
+                }
+            }
+
+            var mouse_last_position = {};
+            var mouse_down = false;
+
+            $("#canvas").on('mousemove', function (event) {
+                if (mouse_down && typeof (mouse_last_position.x) != 'undefined') {
+                    var deltaX = mouse_last_position.x - event.pageX,
+                        deltaY = mouse_last_position.y - event.pageY;
+                    cameraRotate(deltaX, deltaY);
+                    redraw();
+                }
+
+                mouse_last_position = {
+                    x: event.pageX,
+                    y: event.pageY
+                };
+            }).on('mousewheel', function (event) {
+                cameraZoom(event.originalEvent.deltaY < 0);
+                redraw();
+                event.preventDefault();
+            }).mousedown(function () {
+                mouse_down = true
+            }).mouseup(function () {
+                mouse_down = false
+            }).mouseout(function () {
+                mouse_down = false
+            });
+
+            $(window).on('resize', resizeCanvas);
+            resizeCanvas();
+        }();
+    </script>
+</body>
+</html>
